@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Store cloud</title>
+<style>
+  :root {
+    --night: #0d1b2a;
+    --panel: #14263a;
+    --line: #24405c;
+    --frost: #e6f1fa;
+    --mist: #8fa9c2;
+    --ice: #5ec8f2;
+    --ok: #57d9a3;
+    --warn: #f2b84b;
+    --hot: #ff6b5e;
+    --radius: 10px;
+    --gap: 16px;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--night); color: var(--frost); font: 15px/1.45 var(--sans); }
+  header { display: flex; align-items: baseline; gap: var(--gap); flex-wrap: wrap;
+           padding: 20px 24px; border-bottom: 1px solid var(--line); }
+  h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: .02em; }
+  h1 span { color: var(--ice); }
+  h2 { margin: 28px 0 12px; font-size: 12px; font-weight: 600; letter-spacing: .14em;
+       text-transform: uppercase; color: var(--mist); }
+  main { padding: 0 24px 40px; max-width: 1200px; margin: 0 auto; }
+  .muted { color: var(--mist); }
+  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  /* Figures: one row of key numbers */
+  .figures { display: flex; gap: var(--gap); flex-wrap: wrap; margin-top: 20px; }
+  .figure { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+            padding: 12px 18px; min-width: 120px; }
+  .figure b { display: block; font: 600 26px/1.1 var(--mono); }
+  .figure small { color: var(--mist); letter-spacing: .08em; text-transform: uppercase; font-size: 11px; }
+
+  /* Cards: one freezer each */
+  .cards { display: grid; gap: var(--gap); grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--ok);
+          border-radius: var(--radius); padding: 14px 16px; }
+  .card.offline { border-left-color: var(--mist); opacity: .7; }
+  .card.alarm { border-left-color: var(--hot); }
+  .card .name { display: flex; justify-content: space-between; align-items: center; font-weight: 600; }
+  .card .temp { font: 600 34px/1.2 var(--mono); margin: 6px 0 2px; }
+  .card.alarm .temp { color: var(--hot); }
+  .card dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 10px 0 0; font-size: 13px; }
+  .card dt { color: var(--mist); }
+  .card dd { margin: 0; text-align: right; font-family: var(--mono); }
+
+  /* Tags: short states */
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600;
+         letter-spacing: .06em; text-transform: uppercase; border: 1px solid currentColor; }
+  .tag.ok { color: var(--ok); } .tag.off { color: var(--mist); }
+  .tag.warn { color: var(--warn); } .tag.hot { color: var(--hot); }
+
+  /* Tables */
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line);
+          border-radius: var(--radius); overflow: hidden; font-size: 14px; }
+  th { text-align: left; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--mist);
+       font-weight: 600; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+  td { padding: 9px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  .empty { padding: 18px; color: var(--mist); background: var(--panel); border: 1px dashed var(--line);
+           border-radius: var(--radius); }
+  .banner { margin-top: 20px; padding: 10px 14px; border: 1px solid var(--warn); color: var(--warn);
+            border-radius: var(--radius); }
+</style>
+</head>
+<body>
+<header>
+  <h1><span id="store">Store</span> · freezers</h1>
+  <span class="muted" id="synced"></span>
+</header>
+<main>
+  <div class="banner" id="error" hidden></div>
+  <div class="figures" id="figures"></div>
+
+  <h2>Freezers</h2>
+  <div class="cards" id="cards"></div>
+
+  <h2>Maintenance requests</h2>
+  <div id="maintenance"></div>
+</main>
+<script>
+const el = (tag, cls, text) => {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+};
+const degrees = value => value.toFixed(1) + " °C";
+const clock = iso => new Date(iso).toLocaleTimeString();
+
+function figure(label, value) {
+  const box = el("div", "figure");
+  box.append(el("b", "", String(value)), el("small", "", label));
+  return box;
+}
+
+function card(freezer) {
+  const offline = freezer.status === "offline";
+  const box = el("div", "card" + (offline ? " offline" : freezer.alarm ? " alarm" : ""));
+  const name = el("div", "name", freezer.name);
+  name.append(offline ? el("span", "tag off", "offline")
+            : freezer.alarm ? el("span", "tag hot", "too warm")
+            : freezer.defrosting ? el("span", "tag warn", "defrost")
+            : freezer.door_open ? el("span", "tag warn", "door open")
+            : el("span", "tag ok", "ok"));
+  const facts = el("dl");
+  const fact = (label, value) => facts.append(el("dt", "", label), el("dd", "", value));
+  fact("Setpoint", degrees(freezer.setpoint_c));
+  fact("Door", freezer.door_open ? "open" : "closed");
+  fact("Software", freezer.software_version);
+  fact("Last seen", clock(freezer.last_seen));
+  box.append(name, el("div", "temp", degrees(freezer.temperature_c)), facts);
+  return box;
+}
+
+function maintenanceTable(decisions) {
+  if (!decisions.length) return el("div", "empty", "No maintenance requests yet.");
+  const table = el("table");
+  const head = el("tr");
+  ["Time", "Freezer", "Request", "Technician", "Decision", "Reason"].forEach(t => head.append(el("th", "", t)));
+  table.append(head);
+  for (const d of decisions) {
+    const row = el("tr");
+    const params = Object.entries(d.params).map(([k, v]) => `${k}=${v}`).join(", ");
+    const decision = el("td");
+    decision.append(el("span", "tag " + (d.decision === "approve" ? "ok" : "hot"),
+                       d.decision === "approve" ? "approved" : "rejected"));
+    row.append(el("td", "num", clock(d.decided_at)), el("td", "", d.freezer_id),
+               el("td", "num", `${d.action} ${params}`), el("td", "num", d.technician || "–"),
+               decision, el("td", "muted", d.reason || ""));
+    table.append(row);
+  }
+  return table;
+}
+
+async function refresh() {
+  try {
+    const [summary, freezers, decisions] = await Promise.all(
+      ["/summary", "/freezers", "/maintenance-requests?limit=15"].map(u => fetch(u).then(r => r.json())));
+    document.getElementById("store").textContent = summary.store || "Store";
+    document.getElementById("synced").textContent =
+      summary.last_sync ? "read from the store at " + clock(summary.last_sync) : "waiting for the store…";
+    const error = document.getElementById("error");
+    error.hidden = !summary.sync_error;
+    error.textContent = summary.sync_error ? "The store API cannot be read: " + summary.sync_error : "";
+    const software = Object.entries(summary.software).map(([v, n]) => `${v} × ${n}`).join("  ") || "–";
+    document.getElementById("figures").replaceChildren(
+      figure("Freezers", summary.freezers), figure("Online", summary.online),
+      figure("Offline", summary.offline), figure("Alarms", summary.alarms), figure("Software", software));
+    document.getElementById("cards").replaceChildren(...freezers.map(card));
+    document.getElementById("maintenance").replaceChildren(maintenanceTable(decisions));
+  } catch (problem) {
+    document.getElementById("synced").textContent = "service not reachable";
+  }
+}
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
