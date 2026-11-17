@@ -13,8 +13,9 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from storecloud.config import Settings
-from storecloud.db import Database, Freezer
+from storecloud.db import Database, Freezer, Rollout, RolloutFreezer
 from storecloud.maintenance import Approver
+from storecloud.rollout import RolloutEngine
 from storecloud.storeapi import Software, StoreApi, StoreApiError, http_client
 from storecloud.sync import sync_freezers
 
@@ -66,16 +67,72 @@ class DecisionOut(BaseModel):
     decided_at: datetime
 
 
+class RolloutFreezerOut(BaseModel):
+    freezer_id: str
+    canary: bool
+    state: str
+    attempts: int
+    error: str | None
+    installed_at: datetime | None
+
+
+class RolloutOut(BaseModel):
+    id: int
+    version: str
+    state: str
+    canary_count: int
+    max_attempts: int
+    max_failed: int
+    created_at: datetime
+    finished_at: datetime | None
+    freezers: list[RolloutFreezerOut]
+
+
+class StartRolloutBody(BaseModel):
+    version: str
+    freezer_ids: list[str] | None = None
+    canary_count: int = 2
+    max_attempts: int = 3
+    max_failed: int = 1
+
+
 def _utc(seconds: float) -> datetime:
     return datetime.fromtimestamp(seconds, UTC)
 
 
+def _rf_out(rf: RolloutFreezer) -> RolloutFreezerOut:
+    return RolloutFreezerOut(
+        freezer_id=rf.freezer_id,
+        canary=rf.canary,
+        state=rf.state,
+        attempts=rf.attempts,
+        error=rf.error,
+        installed_at=_utc(rf.installed_at) if rf.installed_at else None,
+    )
+
+
+def _rollout_out(rollout: Rollout) -> RolloutOut:
+    return RolloutOut(
+        id=rollout.id,
+        version=rollout.version,
+        state=rollout.state,
+        canary_count=rollout.canary_count,
+        max_attempts=rollout.max_attempts,
+        max_failed=rollout.max_failed,
+        created_at=_utc(rollout.created_at),
+        finished_at=_utc(rollout.finished_at) if rollout.finished_at else None,
+        freezers=[_rf_out(rf) for rf in rollout.freezers],
+    )
+
+
 class Worker:
-    """Background work, one pass every poll interval: read the freezers, decide maintenance requests."""
+    """Background work, one pass every poll interval:
+    read the freezers, decide maintenance requests, process rollouts."""
 
     def __init__(self, api: StoreApi, db: Database, clock: Callable[[], float], interval: float):
         self.api, self.db, self.clock, self.interval = api, db, clock, interval
         self.approver = Approver(api, db, clock)
+        self.rollout_engine = RolloutEngine(api, db, clock)
         self.store_name: str | None = None
         self.last_sync: float | None = None
         self.error: str | None = None
@@ -88,6 +145,19 @@ class Worker:
                 self.store_name = self.api.store().name
             sync_freezers(self.api, self.db)
             self.approver.run_once()
+            # Process rollouts - re-fetch each rollout to get fresh state
+            for rollout in self.rollout_engine.list_rollouts(10):
+                if rollout.state == "running":
+                    # Re-fetch to ensure we have the latest state (pause/cancel could have happened)
+                    fresh_rollout = self.rollout_engine.get_rollout(rollout.id)
+                    if fresh_rollout and fresh_rollout.state == "running":
+                        self.rollout_engine.process_rollout(fresh_rollout.id)
+                        self.rollout_engine.sync_freezer_states(fresh_rollout.id)
+                elif rollout.state == "paused":
+                    # Still sync freezer states for paused rollouts to capture in-progress installs
+                    fresh_rollout = self.rollout_engine.get_rollout(rollout.id)
+                    if fresh_rollout and fresh_rollout.state == "paused":
+                        self.rollout_engine.sync_freezer_states(fresh_rollout.id)
             self.last_sync, self.error = self.clock(), None
         except Exception as error:  # noqa: BLE001 - the loop must survive any failed pass
             self.error = str(error)
@@ -192,6 +262,72 @@ def create_app(settings: Settings | None = None, store_api: StoreApi | None = No
                             technician=d.technician, decision=d.decision, reason=d.reason,
                             decided_at=_utc(d.decided_at))
                 for d in db.decisions(limit)]
+
+    @app.post("/rollouts", status_code=201)
+    def create_rollout(body: StartRolloutBody) -> RolloutOut:
+        # Check for existing running or paused rollout
+        existing = worker.rollout_engine.list_rollouts(1)
+        if existing and existing[0].state in ("running", "paused"):
+            raise HTTPException(409, "a rollout is already running or paused")
+        try:
+            rollout = worker.rollout_engine.start_rollout(
+                version=body.version,
+                freezer_ids=body.freezer_ids,
+                canary_count=body.canary_count,
+                max_attempts=body.max_attempts,
+                max_failed=body.max_failed,
+            )
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+        except StoreApiError as error:
+            if error.code == "unknown_version":
+                raise HTTPException(404, str(error)) from error
+            if error.code == "unknown_freezer":
+                raise HTTPException(422, str(error)) from error
+            raise HTTPException(502, str(error)) from error
+        return _rollout_out(rollout)
+
+    @app.get("/rollouts")
+    def list_rollouts(limit: int = Query(10, ge=1, le=100)) -> list[RolloutOut]:
+        rollouts = worker.rollout_engine.list_rollouts(limit)
+        return [_rollout_out(r) for r in rollouts]
+
+    @app.get("/rollouts/{rollout_id}")
+    def get_rollout(rollout_id: int) -> RolloutOut:
+        rollout = worker.rollout_engine.get_rollout(rollout_id)
+        if rollout is None:
+            raise HTTPException(404, "unknown rollout")
+        return _rollout_out(rollout)
+
+    @app.post("/rollouts/{rollout_id}/pause")
+    def pause_rollout(rollout_id: int) -> RolloutOut:
+        rollout = worker.rollout_engine.get_rollout(rollout_id)
+        if rollout is None:
+            raise HTTPException(404, "unknown rollout")
+        if rollout.state != "running":
+            raise HTTPException(409, "rollout not running")
+        rollout = worker.rollout_engine.pause_rollout(rollout_id)
+        return _rollout_out(rollout)
+
+    @app.post("/rollouts/{rollout_id}/resume")
+    def resume_rollout(rollout_id: int) -> RolloutOut:
+        rollout = worker.rollout_engine.get_rollout(rollout_id)
+        if rollout is None:
+            raise HTTPException(404, "unknown rollout")
+        if rollout.state != "paused":
+            raise HTTPException(409, "rollout not paused")
+        rollout = worker.rollout_engine.resume_rollout(rollout_id)
+        return _rollout_out(rollout)
+
+    @app.post("/rollouts/{rollout_id}/cancel")
+    def cancel_rollout(rollout_id: int) -> RolloutOut:
+        rollout = worker.rollout_engine.get_rollout(rollout_id)
+        if rollout is None:
+            raise HTTPException(404, "unknown rollout")
+        if rollout.state not in ("running", "paused"):
+            raise HTTPException(409, "rollout not running or paused")
+        rollout = worker.rollout_engine.cancel_rollout(rollout_id)
+        return _rollout_out(rollout)
 
     @app.get("/", include_in_schema=False)
     def dashboard() -> FileResponse:
